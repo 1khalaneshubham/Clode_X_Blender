@@ -1,0 +1,741 @@
+"""
+Cricket Stadium – Complete Blender Python Script
+=================================================
+Paste into Blender's Scripting editor and press Run Script.
+Tested on Blender 3.0+. No external files or add-ons required.
+
+Controls after running:
+  - Numpad 0  : jump to the overview camera
+  - Navigate normally in the 3D viewport
+  - Camera_Point_* empties mark useful camera positions
+"""
+
+import bpy
+import bmesh
+import math
+import random
+from mathutils import Vector, Matrix, Euler
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def clear_scene():
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete(use_global=False)
+    for col in list(bpy.data.collections):
+        bpy.data.collections.remove(col)
+    for block in (bpy.data.meshes, bpy.data.materials, bpy.data.cameras,
+                  bpy.data.lights, bpy.data.curves, bpy.data.objects):
+        for item in list(block):
+            try: block.remove(item)
+            except: pass
+
+def gcol(name, parent=None):
+    if name in bpy.data.collections:
+        return bpy.data.collections[name]
+    col = bpy.data.collections.new(name)
+    (parent or bpy.context.scene.collection).children.link(col)
+    return col
+
+def lnk(obj, col):
+    if obj.name not in col.objects:
+        col.objects.link(obj)
+    if obj.name in bpy.context.scene.collection.objects:
+        bpy.context.scene.collection.objects.unlink(obj)
+
+def mk_mat(name, color, rough=0.8, metal=0.0, emit_col=None, emit_str=5.0,
+           ior=1.45, alpha=1.0, spec=0.5):
+    """Create or return a Principled BSDF material."""
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    m = bpy.data.materials.new(name)
+    m.use_nodes = True
+    b = m.node_tree.nodes["Principled BSDF"]
+    b.inputs["Base Color"].default_value  = (*color, 1)
+    b.inputs["Roughness"].default_value   = rough
+    b.inputs["Metallic"].default_value    = metal
+    if emit_col:
+        b.inputs["Emission Color"].default_value    = (*emit_col, 1)
+        b.inputs["Emission Strength"].default_value = emit_str
+    return m
+
+def set_mat(obj, m):
+    obj.data.materials.clear()
+    obj.data.materials.append(m)
+
+def apply_transforms(obj):
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+def deselect_all():
+    bpy.ops.object.select_all(action='DESELECT')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCEDURAL MATERIALS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_grass_mat(name, base=(0.04, 0.30, 0.04)):
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    m = bpy.data.materials.new(name)
+    m.use_nodes = True
+    nt = m.node_tree; N = nt.nodes; L = nt.links; N.clear()
+    out  = N.new("ShaderNodeOutputMaterial");  out.location  = (700, 0)
+    bsdf = N.new("ShaderNodeBsdfDiffuse");     bsdf.location = (500, 0)
+    mix  = N.new("ShaderNodeMixRGB");          mix.location  = (300, 0)
+    mix.blend_type = 'MULTIPLY'; mix.inputs[0].default_value = 0.5
+    nse  = N.new("ShaderNodeTexNoise");        nse.location  = (50, 0)
+    nse.inputs["Scale"].default_value   = 35
+    nse.inputs["Detail"].default_value  = 8
+    nse.inputs["Roughness"].default_value = 0.7
+    c1   = N.new("ShaderNodeRGB");             c1.location   = (50, 200)
+    c2   = N.new("ShaderNodeRGB");             c2.location   = (50,-150)
+    c1.outputs[0].default_value = (*base, 1)
+    c2.outputs[0].default_value = (base[0]*1.4, base[1]*1.4, base[2]*1.4, 1)
+    L.new(nse.outputs["Color"], mix.inputs[1])
+    L.new(c1.outputs[0],        mix.inputs[2])
+    L.new(mix.outputs[0],       bsdf.inputs["Color"])
+    L.new(bsdf.outputs[0],      out.inputs[0])
+    return m
+
+def make_pitch_mat():
+    name = "PitchMat"
+    if name in bpy.data.materials: return bpy.data.materials[name]
+    m = bpy.data.materials.new(name); m.use_nodes = True
+    nt = m.node_tree; N = nt.nodes; L = nt.links; N.clear()
+    out  = N.new("ShaderNodeOutputMaterial");  out.location=(700,0)
+    bsdf = N.new("ShaderNodeBsdfPrincipled");  bsdf.location=(450,0)
+    bsdf.inputs["Roughness"].default_value = 0.92
+    mix  = N.new("ShaderNodeMixRGB");          mix.location=(200,0)
+    mix.blend_type = 'MIX'
+    nse  = N.new("ShaderNodeTexNoise");        nse.location=(-50,0)
+    nse.inputs["Scale"].default_value=18; nse.inputs["Detail"].default_value=6
+    c1   = N.new("ShaderNodeRGB"); c1.location=(-50,200)
+    c1.outputs[0].default_value=(0.73,0.61,0.42,1)
+    c2   = N.new("ShaderNodeRGB"); c2.location=(-50,-150)
+    c2.outputs[0].default_value=(0.52,0.40,0.26,1)
+    L.new(nse.outputs["Fac"],   mix.inputs[0])
+    L.new(c1.outputs[0],        mix.inputs[1])
+    L.new(c2.outputs[0],        mix.inputs[2])
+    L.new(mix.outputs[0],       bsdf.inputs["Base Color"])
+    L.new(bsdf.outputs[0],      out.inputs[0])
+    return m
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. PLAYING FIELD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_playing_field(root_col):
+    col = gcol("Field", root_col)
+
+    # Ground base plane (large square for shadows)
+    bpy.ops.mesh.primitive_plane_add(size=300, location=(0,0,-0.05))
+    gnd = bpy.context.active_object; gnd.name = "Ground_Base"
+    set_mat(gnd, mk_mat("DirtGround",(0.35,0.28,0.18),0.95)); lnk(gnd, col)
+
+    # Outfield disc
+    bpy.ops.mesh.primitive_circle_add(vertices=128, radius=82,
+                                      fill_type='NGON', location=(0,0,0))
+    out_f = bpy.context.active_object; out_f.name = "Outfield"
+    set_mat(out_f, make_grass_mat("GrassOutfield",(0.04,0.28,0.04))); lnk(out_f, col)
+
+    # Infield circle (30m)
+    bpy.ops.mesh.primitive_circle_add(vertices=128, radius=30,
+                                      fill_type='NGON', location=(0,0,0.001))
+    in_f = bpy.context.active_object; in_f.name = "Infield"
+    set_mat(in_f, make_grass_mat("GrassInfield",(0.05,0.35,0.05))); lnk(in_f, col)
+
+    # Stadium floor apron (concrete ring between outfield and stands)
+    bpy.ops.mesh.primitive_circle_add(vertices=128, radius=82,
+                                      fill_type='NGON', location=(0,0,-0.01))
+    apron = bpy.context.active_object; apron.name = "Apron"
+    set_mat(apron, mk_mat("ApronConc",(0.5,0.5,0.5),0.9)); lnk(apron, col)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. PITCH, CREASES, STUMPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_pitch(root_col):
+    col = gcol("Pitch", root_col)
+    white_m = mk_mat("WhiteCrease",(1,1,1),0.3)
+    wood_m  = mk_mat("WoodStump", (0.65,0.45,0.25),0.5,0.05)
+    bail_m  = mk_mat("BailMat",   (0.70,0.48,0.20),0.4)
+
+    # Pitch rectangle (20.12m × 3.05m)
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0,0,0.05))
+    pitch = bpy.context.active_object; pitch.name = "Pitch_Block"
+    pitch.scale = (3.05, 20.12, 0.1)
+    bpy.ops.object.transform_apply(scale=True)
+    set_mat(pitch, make_pitch_mat()); lnk(pitch, col)
+
+    # Creases
+    crease_defs = [
+        ("BatCr_N",    0,  8.53, 0.102, 3.66, 0.08),
+        ("BatCr_S",    0, -8.53, 0.102, 3.66, 0.08),
+        ("BowlCr_N",   0, 10.06, 0.102, 3.66, 0.06),
+        ("BowlCr_S",   0,-10.06, 0.102, 3.66, 0.06),
+        ("RetCr_N1",  1.83, 9.2, 0.102, 0.06, 2.0),
+        ("RetCr_N2", -1.83, 9.2, 0.102, 0.06, 2.0),
+        ("RetCr_S1",  1.83,-9.2, 0.102, 0.06, 2.0),
+        ("RetCr_S2", -1.83,-9.2, 0.102, 0.06, 2.0),
+    ]
+    for nm,x,y,z,sx,sy in crease_defs:
+        bpy.ops.mesh.primitive_plane_add(size=1, location=(x,y,z))
+        cr = bpy.context.active_object; cr.name = nm
+        cr.scale = (sx,sy,1)
+        bpy.ops.object.transform_apply(scale=True)
+        set_mat(cr, white_m); lnk(cr, col)
+
+    # Stumps & bails at both ends
+    stump_y = [10.38, -10.38]
+    stump_x = [-0.1143, 0.0, 0.1143]
+    for end_y in stump_y:
+        for sx in stump_x:
+            bpy.ops.mesh.primitive_cylinder_add(
+                vertices=12, radius=0.022, depth=0.72,
+                location=(sx, end_y, 0.41))
+            s = bpy.context.active_object; s.name = f"Stump_{end_y:.0f}_{sx:.3f}"
+            set_mat(s, wood_m); lnk(s, col)
+        for bx in [-0.057, 0.057]:
+            bpy.ops.mesh.primitive_cylinder_add(
+                vertices=8, radius=0.009, depth=0.112,
+                location=(bx, end_y, 0.775))
+            bl = bpy.context.active_object; bl.name = f"Bail_{end_y:.0f}_{bx:.2f}"
+            bl.rotation_euler = (0, math.radians(90), 0)
+            bpy.ops.object.transform_apply(rotation=True)
+            set_mat(bl, bail_m); lnk(bl, col)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. BOUNDARY ROPE & FLAGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_boundary(root_col):
+    col = gcol("Boundary", root_col)
+    rope_r = mk_mat("RopeRed",  (0.85,0.05,0.05),0.7)
+    rope_w = mk_mat("RopeWhite",(0.95,0.95,0.95),0.7)
+    pole_m = mk_mat("FlagPole", (0.8,0.8,0.8),0.4,0.6)
+    flag_m = mk_mat("FlagYellow",(0.95,0.82,0.0),0.8)
+
+    N = 96; R = 75.5
+    for i in range(N):
+        a = (i / N) * 2 * math.pi
+        x = math.cos(a)*R; y = math.sin(a)*R
+        bpy.ops.mesh.primitive_torus_add(
+            major_radius=0.22, minor_radius=0.10,
+            major_segments=10, minor_segments=6,
+            location=(x, y, 0.10))
+        t = bpy.context.active_object; t.name = f"Rope_{i:03d}"
+        set_mat(t, rope_r if i % 2 == 0 else rope_w)
+        lnk(t, col)
+
+    # Flags every 20°
+    for i in range(18):
+        a = math.radians(i * 20)
+        x = math.cos(a)*R; y = math.sin(a)*R
+        bpy.ops.mesh.primitive_cylinder_add(
+            vertices=6, radius=0.04, depth=1.6, location=(x, y, 0.8))
+        p = bpy.context.active_object; p.name = f"FlagPole_{i}"
+        set_mat(p, pole_m); lnk(p, col)
+        bpy.ops.mesh.primitive_plane_add(size=1, location=(x+0.22, y, 1.5))
+        f = bpy.context.active_object; f.name = f"Flag_{i}"
+        f.scale = (0.45, 0.28, 1)
+        bpy.ops.object.transform_apply(scale=True)
+        set_mat(f, flag_m); lnk(f, col)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. STANDS  (arc wedge method – all geometry via bpy.ops + scale)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_stands(root_col):
+    """
+    Build four stand sections using simple cylinder-sector wedges.
+    Each section has lower + upper tier backing + coloured seat surface + canopy.
+    """
+    col = gcol("Stands", root_col)
+    con_m  = mk_mat("Concrete",   (0.52,0.52,0.52),0.9)
+    roof_m = mk_mat("RoofMetal",  (0.75,0.75,0.78),0.25,0.8)
+
+    # Section definitions: (name, angle_start°, angle_end°, seat_color)
+    sections = [
+        ("Pavilion",  -18,  18, (0.58,0.48,0.32)),  # south / pavilion end
+        ("Members",    28, 152, (0.10,0.22,0.80)),   # east arc
+        ("General_N", 162, 198, (0.78,0.12,0.12)),   # north end
+        ("General_W", 208, 332, (0.10,0.55,0.10)),   # west arc
+    ]
+
+    def make_arc_solid(name, a0_d, a1_d, r_in, r_out, z_bot, z_top, mat_ob, col_ob, steps=64):
+        """Build a solid arc wedge as a single extruded mesh."""
+        bm = bmesh.new()
+        a0 = math.radians(a0_d); a1 = math.radians(a1_d)
+        bot_in=[]; bot_out=[]; top_in=[]; top_out=[]
+        for i in range(steps+1):
+            t = i/steps; a = a0 + t*(a1-a0)
+            ca,sa = math.cos(a),math.sin(a)
+            bot_in.append( bm.verts.new((ca*r_in,  sa*r_in,  z_bot)))
+            bot_out.append(bm.verts.new((ca*r_out, sa*r_out, z_bot)))
+            top_in.append( bm.verts.new((ca*r_in,  sa*r_in,  z_top)))
+            top_out.append(bm.verts.new((ca*r_out, sa*r_out, z_top)))
+        for i in range(steps):
+            # top face
+            bm.faces.new([top_in[i], top_in[i+1], top_out[i+1], top_out[i]])
+            # outer wall
+            bm.faces.new([bot_out[i], bot_out[i+1], top_out[i+1], top_out[i]])
+            # inner wall
+            bm.faces.new([top_in[i], top_in[i+1], bot_in[i+1], bot_in[i]])
+        # end caps
+        bm.faces.new([bot_in[0],  bot_out[0],  top_out[0],  top_in[0]])
+        bm.faces.new([bot_out[-1],bot_in[-1],  top_in[-1],  top_out[-1]])
+        # bottom face
+        for i in range(steps):
+            bm.faces.new([bot_out[i], bot_in[i], bot_in[i+1], bot_out[i+1]])
+        me = bpy.data.meshes.new(name); bm.to_mesh(me); bm.free()
+        ob = bpy.data.objects.new(name, me)
+        lnk(ob, col_ob); ob.data.materials.clear(); ob.data.materials.append(mat_ob)
+        return ob
+
+    STEP = 48
+    for sname, a0, a1, sc in sections:
+        sec_col = gcol(sname, col)
+        sm = mk_mat(f"Seat_{sname}", sc, 0.85)
+
+        # ── Lower tier ──
+        make_arc_solid(f"{sname}_LT_Concrete", a0,a1, 83,97,  0.0, 6.0, con_m, sec_col, STEP)
+        make_arc_solid(f"{sname}_LT_Seats",    a0,a1, 83,97,  6.0, 6.6, sm,    sec_col, STEP)
+
+        # ── Upper tier ──
+        make_arc_solid(f"{sname}_UT_Concrete", a0,a1, 96,114, 6.0,13.5, con_m, sec_col, STEP)
+        make_arc_solid(f"{sname}_UT_Seats",    a0,a1, 96,114,13.5,14.1, sm,    sec_col, STEP)
+
+        # ── Roof canopy ──
+        make_arc_solid(f"{sname}_Roof",        a0,a1, 98,118,14.8,15.2, roof_m,sec_col, STEP)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CROWD  (low-poly figures placed in arc rows via mesh instancing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_crowd(root_col):
+    """
+    Crowd = simple low-poly silhouettes placed along seating arcs.
+    Each figure is a single merged mesh (box body + sphere head).
+    We build one template and then place empties referencing it.
+    """
+    col = gcol("Crowd", root_col)
+
+    # Build a single low-poly person mesh
+    shirt_colors = [
+        (0.9,0.1,0.1),(0.1,0.1,0.9),(0.1,0.7,0.1),
+        (0.9,0.9,0.0),(0.9,0.5,0.1),(0.8,0.1,0.8),
+        (0.95,0.95,0.95),(0.1,0.1,0.1),
+    ]
+    person_meshes = []
+    for ci,sc in enumerate(shirt_colors):
+        bm = bmesh.new()
+        # Body
+        bmesh.ops.create_cube(bm,size=1)
+        # Scale to body proportions
+        for v in bm.verts: v.co.x*=0.28; v.co.y*=0.18; v.co.z*=0.45
+        # Head
+        bm2 = bmesh.new()
+        bmesh.ops.create_icosphere(bm2, subdivisions=1, radius=0.15)
+        for v in bm2.verts: v.co.z += 0.62
+        for v in bm2.verts: bm.verts.new(v.co)
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        me = bpy.data.meshes.new(f"Person_{ci}")
+        bm.to_mesh(me); bm.free(); bm2.free()
+        ob = bpy.data.objects.new(f"Person_Template_{ci}", me)
+        skin_m = mk_mat(f"Shirt_{ci}", sc, 0.9)
+        ob.data.materials.clear(); ob.data.materials.append(skin_m)
+        # Don't link template to scene, just keep in data
+        person_meshes.append(ob)
+
+    # Sections and their tier radii/z
+    sections = [
+        (-18,  18, [(84,6.8),(100,14.3)]),
+        ( 28, 152, [(84,6.8),(100,14.3)]),
+        (162, 198, [(84,6.8),(100,14.3)]),
+        (208, 332, [(84,6.8),(100,14.3)]),
+    ]
+
+    rng = random.Random(7)
+    placed = 0
+    MAX = 3000  # cap for performance
+
+    for a0_d, a1_d, tiers in sections:
+        for r_crowd, z_crowd in tiers:
+            a0 = math.radians(a0_d); a1 = math.radians(a1_d)
+            arc_len = r_crowd * abs(a1 - a0)
+            n_people = min(int(arc_len / 1.05), 400)
+            for k in range(n_people):
+                if placed >= MAX: break
+                if rng.random() > 0.72: continue  # 72% fill
+                t = (k + rng.uniform(0,0.8)) / n_people
+                a = a0 + t*(a1-a0)
+                x = math.cos(a)*(r_crowd + rng.uniform(-0.3,0.3))
+                y = math.sin(a)*(r_crowd + rng.uniform(-0.3,0.3))
+                z = z_crowd + rng.uniform(0,0.2)
+                ci = rng.randint(0,7)
+                pm = person_meshes[ci]
+                # Instance via object.copy
+                inst = pm.copy()
+                inst.data = pm.data.copy()
+                inst.location = (x, y, z)
+                inst.rotation_euler = (0,0, a + math.pi + rng.uniform(-0.2,0.2))
+                lnk(inst, col)
+                placed += 1
+            if placed >= MAX: break
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. PAVILION BUILDING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_pavilion(root_col):
+    col = gcol("Pavilion_Building", root_col)
+    facade_m = mk_mat("PavilionFacade",(0.88,0.85,0.78),0.8)
+    glass_m  = mk_mat("Glass",        (0.5,0.7,0.9),0.05,0.0)
+    floor_m  = mk_mat("PavFloor",     (0.6,0.55,0.45),0.7)
+    balc_m   = mk_mat("Balcony",      (0.75,0.72,0.65),0.7)
+    flag_m   = mk_mat("PavFlag",      (0.05,0.2,0.6),0.8)
+
+    # Main building block (behind pavilion stand, south side)
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0,-97,10))
+    main = bpy.context.active_object; main.name = "Pavilion_Main"
+    main.scale = (25,8,20); bpy.ops.object.transform_apply(scale=True)
+    set_mat(main, facade_m); lnk(main, col)
+
+    # Glass windows (3 rows × 6 cols)
+    for row in range(3):
+        for col_i in range(6):
+            x = -10.5 + col_i*4.0; z = 3 + row*5.5
+            bpy.ops.mesh.primitive_cube_add(size=1, location=(x,-93.1,z))
+            w = bpy.context.active_object; w.name = f"Window_{row}_{col_i}"
+            w.scale=(1.6,0.1,2.0); bpy.ops.object.transform_apply(scale=True)
+            set_mat(w, glass_m); lnk(w, col)
+
+    # Balcony slab
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0,-91,12))
+    bal = bpy.context.active_object; bal.name = "Balcony_Slab"
+    bal.scale=(24,1.5,0.3); bpy.ops.object.transform_apply(scale=True)
+    set_mat(bal, balc_m); lnk(bal, col)
+
+    # Flags on roof
+    for fi,xf in enumerate([-8,0,8]):
+        bpy.ops.mesh.primitive_cylinder_add(vertices=6,radius=0.15,depth=4,
+                                             location=(xf,-96,22))
+        fp=bpy.context.active_object; fp.name=f"PavFlagPole_{fi}"
+        set_mat(fp,mk_mat("FlagpoleM",(0.8,0.8,0.8),0.3,0.7)); lnk(fp,col)
+        bpy.ops.mesh.primitive_plane_add(size=1,location=(xf+0.7,-96,23.5))
+        ff=bpy.context.active_object; ff.name=f"PavFlagBanner_{fi}"
+        ff.scale=(1.4,0.8,1); bpy.ops.object.transform_apply(scale=True)
+        set_mat(ff,flag_m); lnk(ff,col)
+
+    # Sight screens (large white boards behind bowler arms, Y+ and Y- ends)
+    screen_m = mk_mat("SightScreen",(0.97,0.97,0.97),0.05)
+    for sign,name in [(1,"SightScreen_N"),(-1,"SightScreen_S")]:
+        bpy.ops.mesh.primitive_cube_add(size=1,location=(0,sign*84,3))
+        ss=bpy.context.active_object; ss.name=name
+        ss.scale=(12,0.3,5); bpy.ops.object.transform_apply(scale=True)
+        set_mat(ss,screen_m); lnk(ss,col)
+        # Frame
+        bpy.ops.mesh.primitive_cube_add(size=1,location=(0,sign*84,3))
+        fr=bpy.context.active_object; fr.name=f"{name}_Frame"
+        fr.scale=(12.3,0.4,5.3); bpy.ops.object.transform_apply(scale=True)
+        set_mat(fr,mk_mat("ScreenFrame",(0.3,0.3,0.3),0.5,0.3)); lnk(fr,col)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. SCOREBOARD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_scoreboard(root_col):
+    col = gcol("Scoreboard", root_col)
+    board_m  = mk_mat("BoardBG",  (0.02,0.02,0.02),0.9)
+    panel_m  = mk_mat("LED_Green",(0.0,0.9,0.2),0.5,
+                      emit_col=(0.0,1.0,0.3),emit_str=3.0)
+    struct_m = mk_mat("SteelGrey",(0.5,0.5,0.55),0.3,0.8)
+
+    # Tower support
+    bpy.ops.mesh.primitive_cube_add(size=1,location=(32,-92,9))
+    tow=bpy.context.active_object; tow.name="ScoreboardTower"
+    tow.scale=(2,2,18); bpy.ops.object.transform_apply(scale=True)
+    set_mat(tow,struct_m); lnk(tow,col)
+
+    # Main board
+    bpy.ops.mesh.primitive_cube_add(size=1,location=(32,-93,19))
+    bd=bpy.context.active_object; bd.name="ScoreboardPanel"
+    bd.scale=(14,0.4,6); bpy.ops.object.transform_apply(scale=True)
+    set_mat(bd,board_m); lnk(bd,col)
+
+    # LED display surface
+    bpy.ops.mesh.primitive_plane_add(size=1,location=(32,-92.6,19))
+    led=bpy.context.active_object; led.name="LED_Display"
+    led.scale=(13,5.5,1); bpy.ops.object.transform_apply(scale=True)
+    set_mat(led,panel_m); lnk(led,col)
+
+    # Text objects for score
+    bpy.ops.object.text_add(location=(25,-92.5,20))
+    txt=bpy.context.active_object; txt.name="ScoreText"
+    txt.data.body="IND  256/4\n  OVR 38.2"
+    txt.data.size=1.8; txt.data.align_x='LEFT'
+    txt_m=mk_mat("ScoreTextCol",(0.0,1.0,0.3),0.3,emit_col=(0,1,0.2),emit_str=4)
+    txt.data.materials.clear(); txt.data.materials.append(txt_m)
+    lnk(txt,col)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. FLOODLIGHT TOWERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_floodlights(root_col):
+    col = gcol("Floodlights", root_col)
+    steel_m = mk_mat("FloodSteel",(0.6,0.6,0.65),0.3,0.8)
+    lamp_m  = mk_mat("LampHead",  (1.0,0.95,0.85),0.1,
+                     emit_col=(1.0,0.97,0.88),emit_str=15.0)
+
+    # 6 towers placed around the stadium perimeter
+    tower_angles = [30, 90, 150, 210, 270, 330]
+    tower_r = 90
+
+    for i, a_deg in enumerate(tower_angles):
+        a = math.radians(a_deg)
+        tx = math.cos(a)*tower_r; ty = math.sin(a)*tower_r
+
+        # Mast
+        bpy.ops.mesh.primitive_cylinder_add(
+            vertices=8, radius=0.8, depth=35, location=(tx,ty,17.5))
+        mast=bpy.context.active_object; mast.name=f"Mast_{i}"
+        set_mat(mast,steel_m); lnk(mast,col)
+
+        # Cross arm
+        bpy.ops.mesh.primitive_cylinder_add(
+            vertices=6, radius=0.3, depth=10, location=(tx,ty,35))
+        arm=bpy.context.active_object; arm.name=f"Arm_{i}"
+        arm.rotation_euler=(0,math.radians(90),a)
+        bpy.ops.object.transform_apply(rotation=True)
+        set_mat(arm,steel_m); lnk(arm,col)
+
+        # Lamp cluster (5 lights per tower)
+        for lj in range(5):
+            lx = tx + math.cos(a+math.radians(-40+lj*20))*3
+            ly = ty + math.sin(a+math.radians(-40+lj*20))*3
+            bpy.ops.mesh.primitive_uv_sphere_add(
+                segments=8, ring_count=6, radius=0.5, location=(lx,ly,35.5))
+            lamp=bpy.context.active_object; lamp.name=f"Lamp_{i}_{lj}"
+            set_mat(lamp,lamp_m); lnk(lamp,col)
+
+            # Area light at each lamp position
+            bpy.ops.object.light_add(type='POINT', location=(lx,ly,35))
+            lt=bpy.context.active_object; lt.name=f"FloodLight_{i}_{lj}"
+            lt.data.energy=2000; lt.data.color=(1.0,0.97,0.88)
+            lt.data.shadow_soft_size=2.0
+            lnk(lt,col)
+
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. ADVERTISEMENT BOARDS (along boundary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_ad_boards(root_col):
+    col = gcol("AdBoards", root_col)
+    colors = [
+        (0.8,0.1,0.1),(0.1,0.1,0.8),(0.9,0.7,0.0),
+        (0.1,0.6,0.1),(0.6,0.1,0.6),(0.9,0.4,0.0),
+    ]
+    N = 24; R = 78.5
+    for i in range(N):
+        a = (i/N)*2*math.pi + math.radians(7.5)
+        x = math.cos(a)*R; y = math.sin(a)*R
+        c = colors[i % len(colors)]
+        bpy.ops.mesh.primitive_cube_add(size=1,location=(x,y,0.9))
+        bd=bpy.context.active_object; bd.name=f"AdBoard_{i}"
+        bd.scale=(3.5,0.15,1.8)
+        bpy.ops.object.transform_apply(scale=True)
+        bd.rotation_euler=(0,0,a+math.radians(90))
+        bpy.ops.object.transform_apply(rotation=True)
+        set_mat(bd,mk_mat(f"Ad_{i}",c,0.7)); lnk(bd,col)
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. DUGOUTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_dugouts(root_col):
+    col = gcol("Dugouts", root_col)
+    dug_m  = mk_mat("DugoutBase",  (0.35,0.35,0.40),0.85)
+    bench_m= mk_mat("BenchWood",   (0.50,0.35,0.20),0.7)
+    cover_m= mk_mat("DugoutCover", (0.1,0.2,0.55),0.6)
+
+    for sign,name in [(1,"Dugout_E"),(-1,"Dugout_W")]:
+        bx = sign*85
+        # Base
+        bpy.ops.mesh.primitive_cube_add(size=1,location=(bx,0,0.5))
+        dg=bpy.context.active_object; dg.name=f"{name}_Base"
+        dg.scale=(3,6,1); bpy.ops.object.transform_apply(scale=True)
+        set_mat(dg,dug_m); lnk(dg,col)
+        # Benches
+        for bi,by in enumerate([-1.5,0,1.5]):
+            bpy.ops.mesh.primitive_cube_add(size=1,location=(bx,by,1.35))
+            bn=bpy.context.active_object; bn.name=f"{name}_Bench_{bi}"
+            bn.scale=(0.4,1.8,0.15); bpy.ops.object.transform_apply(scale=True)
+            set_mat(bn,bench_m); lnk(bn,col)
+        # Cover
+        bpy.ops.mesh.primitive_cube_add(size=1,location=(bx,0,2.3))
+        cv=bpy.context.active_object; cv.name=f"{name}_Cover"
+        cv.scale=(3.2,6.5,0.15); bpy.ops.object.transform_apply(scale=True)
+        set_mat(cv,cover_m); lnk(cv,col)
+    return col
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. LIGHTING & ENVIRONMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def setup_lighting():
+    scene = bpy.context.scene
+
+    # Sun lamp (main key light)
+    bpy.ops.object.light_add(type='SUN', location=(50,50,60))
+    sun = bpy.context.active_object; sun.name = "Sun_Main"
+    sun.rotation_euler = (math.radians(45), math.radians(20), math.radians(30))
+    sun.data.energy = 5.0
+    sun.data.color  = (1.0, 0.97, 0.88)
+    sun.data.angle  = math.radians(0.5)
+    sun.data.use_shadow = True
+
+    # Fill light (soft ambient from sky direction)
+    bpy.ops.object.light_add(type='SUN', location=(-30,-30,50))
+    fill = bpy.context.active_object; fill.name = "Sun_Fill"
+    fill.rotation_euler=(math.radians(60),math.radians(-15),math.radians(-60))
+    fill.data.energy=1.2; fill.data.color=(0.75,0.85,1.0)
+    fill.data.use_shadow=False
+
+    # World sky gradient
+    world = bpy.data.worlds.new("CricketSky")
+    scene.world = world; world.use_nodes = True
+    wnt = world.node_tree; wN = wnt.nodes; wL = wnt.links; wN.clear()
+    wout   = wN.new("ShaderNodeOutputWorld");  wout.location=(400,0)
+    bg     = wN.new("ShaderNodeBackground");   bg.location=(200,0)
+    sky_c  = wN.new("ShaderNodeTexSky");       sky_c.location=(0,0)
+    sky_c.sky_type='NISHITA'
+    sky_c.sun_elevation = math.radians(45)
+    sky_c.sun_rotation  = math.radians(30)
+    wL.new(sky_c.outputs["Color"], bg.inputs["Color"])
+    wL.new(bg.outputs["Background"], wout.inputs["Surface"])
+    bg.inputs["Strength"].default_value = 1.0
+
+    # Render settings
+    scene.render.engine = 'CYCLES'
+    try:
+        scene.cycles.samples = 128
+        scene.cycles.use_denoising = True
+    except: pass
+    scene.render.resolution_x = 1920
+    scene.render.resolution_y = 1080
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. CAMERAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_cameras(root_col):
+    col = gcol("Cameras", root_col)
+
+    cam_defs = [
+        ("Camera_Overview",   (0,   0,  180), (0, 0, 0)),
+        ("Camera_Pitch",      (0, -25,    3), (math.radians(80),0,0)),
+        ("Camera_Pavilion",   (0, -105,  18), (math.radians(25),0,0)),
+        ("Camera_Boundary_E", (90,  0,   8),  (math.radians(70),0,math.radians(-90))),
+        ("Camera_Stand_High", (50, -70,  22), (math.radians(50),0,math.radians(30))),
+    ]
+    for i,(cname,cloc,crot) in enumerate(cam_defs):
+        bpy.ops.object.camera_add(location=cloc)
+        cam=bpy.context.active_object; cam.name=cname
+        cam.rotation_euler=crot
+        cam.data.lens=35
+        lnk(cam,col)
+        # Also place a named empty at each position for reference
+        bpy.ops.object.empty_add(type='ARROWS',location=cloc)
+        em=bpy.context.active_object; em.name=f"Camera_Point_{i+1}"
+        lnk(em,col)
+
+    # Set first camera as active
+    bpy.context.scene.camera = bpy.data.objects.get("Camera_Overview")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN – assemble everything
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_stadium():
+    random.seed(42)
+
+    print("Clearing scene...")
+    clear_scene()
+
+    ROOT = gcol("Cricket_Stadium")
+
+    print("Creating playing field...")
+    create_playing_field(ROOT)
+
+    print("Creating pitch & stumps...")
+    create_pitch(ROOT)
+
+    print("Creating boundary rope & flags...")
+    create_boundary(ROOT)
+
+    print("Building stands...")
+    build_stands(ROOT)
+
+    print("Adding crowd...")
+    add_crowd(ROOT)
+
+    print("Creating pavilion...")
+    create_pavilion(ROOT)
+
+    print("Creating scoreboard...")
+    create_scoreboard(ROOT)
+
+    print("Creating floodlight towers...")
+    create_floodlights(ROOT)
+
+    print("Adding advertisement boards...")
+    create_ad_boards(ROOT)
+
+    print("Creating dugouts...")
+    create_dugouts(ROOT)
+
+    print("Setting up lighting & environment...")
+    setup_lighting()
+
+    print("Adding cameras...")
+    add_cameras(ROOT)
+
+    # Final viewport settings
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    space.shading.type = 'MATERIAL'
+                    space.overlay.show_floor = True
+
+    print("\n✅  Cricket Stadium build complete!")
+    print("   • Press Numpad 0  → Overview camera")
+    print("   • F12             → Render (Cycles, 128 samples)")
+    print("   • Navigate freely in the 3D viewport")
+    print(f"   • Objects in scene: {len(bpy.data.objects)}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────────────────────────────────────
+build_stadium()
