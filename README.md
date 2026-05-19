@@ -130,7 +130,12 @@ Want to tweak the stadium? Modify the script variables:
 ## 📸 Screenshots
 
 Watch the stadium come to life – from script execution to interactive walkthrough.
-[![Watch the video](https://img.youtube.com/vi/YOUR_VIDEO_ID/0.jpg)]|
+
+![Img1](https://github.com/1khalaneshubham/Clode_X_Blender/blob/main/img1.png)
+![Img2](https://github.com/1khalaneshubham/Clode_X_Blender/blob/main/img2.png)
+![Img3](https://github.com/1khalaneshubham/Clode_X_Blender/blob/main/img3.png)
+![Img4](https://github.com/1khalaneshubham/Clode_X_Blender/blob/main/img4.png)
+![Img5](https://github.com/1khalaneshubham/Clode_X_Blender/blob/main/img5.png)
 
 ---
 
